@@ -1,0 +1,68 @@
+name: Label gate control
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: label-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: Record trigger
+        env:
+          ACTION: ${{ github.event.action }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf 'EVENT_ACTION=%s\n' "$ACTION"
+          printf 'EVENT_HEAD_SHA=%s\n' "$HEAD_SHA"
+
+      - name: Remove label on synchronize
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh api -X DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/ok-to-test" || true
+
+      - name: Check current label
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          LABELS=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.labels[].name')
+          if grep -qx 'ok-to-test' <<< "$LABELS"; then
+            printf 'authorized=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'authorized=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+  execute:
+    needs: policy
+    if: needs.policy.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Execute approved revision
+        env:
+          CONTROL_SECRET: ${{ secrets.CONTROL_SECRET }}
+        run: bash ./payload.sh
